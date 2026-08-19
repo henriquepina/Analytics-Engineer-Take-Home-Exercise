@@ -1,0 +1,47 @@
+name: klaviyo_takehome
+version: "1.0.0"
+config-version: 2
+
+profile: klaviyo_takehome
+
+model-paths: ["models"]
+test-paths: ["tests"]
+clean-targets: ["target"]
+
+vars:
+  # Overlap on ingestion time prevents equal-watermark records from being
+  # missed. Tune from observed source behavior and the agreed freshness SLA.
+  late_arrival_lookback_days: 3
+  # Optional lower bound for a first load. Null means load all available data.
+  initial_load_start: null
+  # Reviewed metric logic. Update only with stakeholder approval and a
+  # versioned definition change. These three lists power the Section 1
+  # signals; is_active uses active_company_event_types (the canonical
+  # definition from Section 3).
+  active_company_event_types:
+    - email_open
+    - email_click
+    - sms_delivered
+  attempted_event_types:
+    - email_send
+    - sms_relayed
+  engaging_event_types:
+    - email_open
+    - email_click
+    - sms_click
+    - sms_inbound
+
+models:
+  klaviyo_takehome:
+    +persist_docs:
+      relation: true
+      columns: true
+    staging:
+      +materialized: view
+      +schema: staging
+    intermediate:
+      +materialized: incremental
+      +schema: intermediate
+    marts:
+      +materialized: incremental
+      +schema: marts

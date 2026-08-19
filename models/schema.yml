@@ -1,0 +1,173 @@
+version: 2
+
+sources:
+  - name: iceberg
+    description: >
+      DE-owned marketing event stream stored in Iceberg on S3 and exposed to
+      Snowflake. Timestamps are expected to be normalized to UTC by the source
+      contract.
+    database: "{{ env_var('EVENTS_DATABASE') }}"
+    schema: "{{ env_var('EVENTS_SCHEMA') }}"
+    config:
+      loaded_at_field: created_at
+      freshness:
+        warn_after: {count: 12, period: hour}
+        error_after: {count: 24, period: hour}
+    tables:
+      - name: events
+        identifier: "{{ env_var('EVENTS_TABLE', 'EVENTS') }}"
+        description: >
+          Append-oriented raw event stream. Replayed event_ids are expected and
+          are resolved downstream using the latest created_at value.
+        columns:
+          - name: event_id
+            description: Globally unique logical event identifier; physical replays may duplicate it.
+            data_tests: [not_null]
+          - name: company_id
+            description: Direct Klaviyo customer identifier.
+            data_tests: [not_null]
+          - name: profile_id
+            description: End-user identifier; may be null for non-profile events.
+          - name: event_type
+            description: Producer-defined event name.
+            data_tests: [not_null]
+          - name: occurred_at
+            description: UTC event time.
+            data_tests: [not_null]
+          - name: created_at
+            description: UTC ingestion/write time used for freshness and incremental processing.
+            data_tests: [not_null]
+          - name: properties
+            description: Arbitrary map<string,string> event metadata supplied by the source.
+
+models:
+  - name: stg_events
+    description: >
+      Lightly normalized, one-to-one view of the raw event stream. This layer
+      performs no metric filtering and does not invent properties that are not
+      present in the source contract.
+    columns:
+      - name: event_id
+        description: Logical event identifier.
+        data_tests: [not_null]
+      - name: company_id
+        description: Direct customer identifier.
+        data_tests: [not_null]
+      - name: profile_id
+        description: End-user identifier; blank strings are normalized to null.
+      - name: event_type
+        description: Lowercase, trimmed producer event type.
+        data_tests: [not_null]
+      - name: occurred_at_utc
+        description: Event time interpreted as UTC under the source contract.
+        data_tests: [not_null]
+      - name: created_at_utc
+        description: Ingestion/write time interpreted as UTC.
+        data_tests: [not_null]
+      - name: properties
+        description: Source map<string,string>, preserved without assumptions about optional keys.
+
+  - name: int_events_deduped
+    description: >
+      Latest known row per event_id, incrementally maintained from ingestion
+      time. Event types in the reviewed project configuration receive metric
+      classification; all other types pass through with counts_as_active=false.
+    columns:
+      - name: event_id
+        description: Unique logical event identifier after replay deduplication.
+        data_tests: [unique, not_null]
+      - name: company_id
+        description: Direct customer identifier.
+        data_tests: [not_null]
+      - name: event_type
+        description: Normalized event type.
+        data_tests: [not_null]
+      - name: occurred_at_utc
+        description: UTC event time used for weekly bucketing.
+        data_tests: [not_null]
+      - name: occurred_date
+        description: UTC event date used for clustering and pruning.
+        data_tests: [not_null]
+      - name: created_at_utc
+        description: UTC ingestion cursor.
+        data_tests: [not_null]
+      - name: counts_as_active
+        description: True when this event qualifies its company as active under metric version v1.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [true, false]
+                quote: false
+      - name: definition_version
+        description: Metric definition version applied to the event classification.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [v1]
+
+  - name: fct_company_engagement_weekly
+    description: >
+      Trusted weekly company-engagement mart. One row represents one company in
+      one UTC ISO week with any recorded event. is_active is true when the week
+      contains at least one email_open, email_click, or sms_delivered event.
+    columns:
+      - name: company_week_key
+        description: Stable surrogate key for the company-week grain.
+        data_tests: [unique, not_null]
+      - name: company_id
+        description: Direct customer identifier observed in the event stream.
+        data_tests: [not_null]
+      - name: week_start
+        description: Monday start date of the UTC ISO week containing occurred_at.
+        data_tests: [not_null]
+      - name: total_events
+        description: All deduplicated events recorded for the company-week.
+        data_tests: [not_null]
+      - name: email_send_events
+        description: Email send events; diagnostic only and not part of active v1.
+        data_tests: [not_null]
+      - name: email_open_events
+        description: Email open events contributing to active v1.
+        data_tests: [not_null]
+      - name: email_click_events
+        description: Email click events contributing to active v1.
+        data_tests: [not_null]
+      - name: sms_delivered_events
+        description: SMS delivery events contributing to active v1.
+        data_tests: [not_null]
+      - name: attempted_events
+        description: >
+          Email send and SMS relay events; the Section 1 "attempted" signal
+          measuring platform use. Diagnostic, not part of is_active.
+        data_tests: [not_null]
+      - name: engaging_events
+        description: >
+          End-user responses (email opens excluding machine-generated opens,
+          email clicks, SMS clicks, inbound SMS); the Section 1 "engaging"
+          signal. Machine opens are identified via an assumed $machine_open
+          property key, disclosed in the notes. Diagnostic, not part of
+          is_active.
+        data_tests: [not_null]
+      - name: active_events
+        description: Sum of email opens, email clicks, and SMS deliveries.
+        data_tests: [not_null]
+      - name: active_profiles
+        description: Distinct non-null profiles attached to active events, scoped to the company.
+        data_tests: [not_null]
+      - name: is_active
+        description: Headline flag; true when active_events is greater than zero.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [true, false]
+                quote: false
+      - name: metric_definition_version
+        description: Version of the active-company definition applied to this row.
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [v1]
+      - name: _max_created_at_utc
+        description: Latest source ingestion time represented in the company-week row.
+      - name: _loaded_at
+        description: Warehouse time when the row was most recently calculated.
